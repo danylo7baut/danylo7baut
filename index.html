@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rally Navigator</title>
+    <meta name="theme-color" content="#1a202c">
+    <link rel="manifest" href="manifest.json">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Racing+Sans+One&display=swap');
+        body {
+            font-family: 'Racing Sans One', sans-serif;
+            background-color: #1a202c;
+            color: #e2e8f0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            text-align: center;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+        #map {
+            height: 400px;
+            width: 100%;
+            max-width: 800px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            margin-bottom: 2rem;
+            border: 2px solid #374151;
+        }
+        .blinking-dot {
+            animation: blink 1s infinite;
+        }
+        @keyframes blink {
+            0% { opacity: 0; }
+            50% { opacity: 1; }
+            100% { opacity: 0; }
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-100 flex flex-col items-center justify-center p-4">
+
+    <div class="max-w-4xl w-full p-8 bg-gray-800 rounded-xl shadow-2xl space-y-8">
+        <div class="flex flex-col items-center">
+            <h1 class="text-4xl font-bold text-yellow-400 mb-2">Rally Navigator</h1>
+            <p id="instructionText" class="text-gray-400 text-sm">Tap the map to set your start and end points.</p>
+        </div>
+
+        <!-- The map container -->
+        <div id="map"></div>
+
+        <!-- Loading spinner -->
+        <div id="loader" class="hidden flex items-center justify-center space-x-2">
+            <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-yellow-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <span class="text-yellow-500 font-bold">Generating route...</span>
+        </div>
+
+        <!-- The main display for navigation instructions -->
+        <div id="navigationDisplay" class="bg-gray-700 p-6 rounded-lg border-2 border-gray-600 hidden">
+            <div id="direction" class="text-5xl font-extrabold text-white mb-2"></div>
+            <div id="sharpness" class="text-2xl text-yellow-300"></div>
+            <div id="location" class="text-sm text-gray-400 mt-2"></div>
+        </div>
+        
+        <!-- Controls for the user to start/stop navigation -->
+        <div class="flex justify-center space-x-4 mt-8">
+             <button id="muteBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-full shadow-lg transition-transform transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-75 hidden">
+                Mute
+            </button>
+            <button id="resetBtn" class="bg-gray-600 hover:bg-gray-700 text-gray-200 font-bold py-3 px-6 rounded-full shadow-lg transition-transform transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-opacity-75 hidden">
+                Reset
+            </button>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            let startMarker = null;
+            let endMarker = null;
+            let routePolyline = null;
+            let currentPositionMarker = null;
+            let watchId = null;
+            let currentRoute = [];
+            let currentPacenotes = [];
+            let currentTurnIndex = 0;
+            let isMuted = false;
+
+            const directionElement = document.getElementById('direction');
+            const sharpnessElement = document.getElementById('sharpness');
+            const locationElement = document.getElementById('location');
+            const instructionText = document.getElementById('instructionText');
+            const loader = document.getElementById('loader');
+            const navigationDisplay = document.getElementById('navigationDisplay');
+            const resetBtn = document.getElementById('resetBtn');
+            const muteBtn = document.getElementById('muteBtn');
+
+            // Initialize the map, centered on a general location
+            const map = L.map('map').setView([35.1856, 33.3823], 8);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+            }).addTo(map);
+
+            // Polyline decoder function for OSRM routes
+            function decodePolyline(str, precision) {
+                let index = 0,
+                    lat = 0,
+                    lng = 0,
+                    coordinates = [],
+                    shift = 0,
+                    result = 0,
+                    byte = null,
+                    factor = Math.pow(10, precision || 5);
+
+                while (index < str.length) {
+                    byte = null;
+                    shift = 0;
+                    result = 0;
+                    do {
+                        byte = str.charCodeAt(index++) - 63;
+                        result |= (byte & 0x1f) << shift;
+                        shift += 5;
+                    } while (byte >= 0x20);
+
+                    lat += ((result & 1) ? ~(result >> 1) : (result >> 1));
+
+                    shift = 0;
+                    result = 0;
+                    do {
+                        byte = str.charCodeAt(index++) - 63;
+                        result |= (byte & 0x1f) << shift;
+                        shift += 5;
+                    } while (byte >= 0x20);
+
+                    lng += ((result & 1) ? ~(result >> 1) : (result >> 1));
+
+                    coordinates.push([lat / factor, lng / factor]);
+                }
+                return coordinates;
+            };
+
+            // Function to generate pacenotes from route geometry
+            function generatePacenotes(route) {
+                const pacenotes = [];
+                for (let i = 1; i < route.length - 1; i++) {
+                    const prev = route[i - 1];
+                    const current = route[i];
+                    const next = route[i + 1];
+
+                    const dx1 = current[1] - prev[1];
+                    const dy1 = current[0] - prev[0];
+                    const dx2 = next[1] - current[1];
+                    const dy2 = next[0] - current[0];
+
+                    const angle1 = Math.atan2(dy1, dx1);
+                    const angle2 = Math.atan2(dy2, dx2);
+
+                    let angleChange = (angle2 - angle1) * 180 / Math.PI;
+                    if (angleChange > 180) angleChange -= 360;
+                    if (angleChange < -180) angleChange += 360;
+
+                    let sharpness = '';
+                    let direction = 'Straight';
+
+                    if (Math.abs(angleChange) > 15) {
+                        if (angleChange > 0) {
+                            direction = 'Left';
+                        } else {
+                            direction = 'Right';
+                        }
+
+                        if (Math.abs(angleChange) > 160) sharpness = "6";
+                        else if (Math.abs(angleChange) > 120) sharpness = "5";
+                        else if (Math.abs(angleChange) > 90) sharpness = "4";
+                        else if (Math.abs(angleChange) > 60) sharpness = "3";
+                        else if (Math.abs(angleChange) > 30) sharpness = "2";
+                        else sharpness = "1";
+
+                        if (Math.abs(angleChange) > 150) direction = (direction === 'Left' ? 'Hairpin Left' : 'Hairpin Right');
+                    }
+                    pacenotes.push({ direction: direction, sharpness: sharpness });
+                }
+                pacenotes.push({ direction: "Finish", sharpness: "" });
+                return pacenotes;
+            }
+
+            // Function to fetch and process the route
+            async function getRoute(start, end) {
+                const url = `https://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=polyline`;
+                loader.classList.remove('hidden');
+
+                try {
+                    const response = await fetch(url);
+                    const data = await response.json();
+
+                    if (data.code === 'Ok' && data.routes.length > 0) {
+                        const encodedPolyline = data.routes[0].geometry;
+                        currentRoute = decodePolyline(encodedPolyline).map(p => [p[0], p[1]]);
+                        currentPacenotes = generatePacenotes(currentRoute);
+
+                        if (routePolyline) {
+                            map.removeLayer(routePolyline);
+                        }
+                        routePolyline = L.polyline(currentRoute, { color: 'yellow', weight: 5 }).addTo(map);
+                        map.fitBounds(routePolyline.getBounds());
+
+                        instructionText.classList.add('hidden');
+                        navigationDisplay.classList.remove('hidden');
+                        resetBtn.classList.remove('hidden');
+                        muteBtn.classList.remove('hidden');
+                        
+                        // Start watching location
+                        watchId = navigator.geolocation.watchPosition(onLocationUpdate, onLocationError, { enableHighAccuracy: true });
+
+                    } else {
+                        throw new Error('Could not find a route.');
+                    }
+                } catch (error) {
+                    instructionText.textContent = 'Error generating route. Please try a different location.';
+                    console.error('Routing error:', error);
+                } finally {
+                    loader.classList.add('hidden');
+                }
+            }
+            
+            // Function to handle map clicks for setting destination
+            map.on('click', (e) => {
+                if (!startMarker) {
+                     if (navigator.geolocation) {
+                        instructionText.textContent = "Getting your current location...";
+                        navigator.geolocation.getCurrentPosition((position) => {
+                            const latlng = { lat: position.coords.latitude, lng: position.coords.longitude };
+                            startMarker = L.marker(latlng, { icon: L.icon({ iconUrl: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="%234CAF50"><path d="M16 0C9.69 0 4.5 5.19 4.5 11.5c0 6.63 11.5 20.5 11.5 20.5s11.5-13.87 11.5-20.5C27.5 5.19 22.31 0 16 0zm0 15c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/></svg>', iconSize: [32, 32], iconAnchor: [16, 32], popupAnchor: [0, -30] }) }).addTo(map)
+                                .bindPopup("Start Point").openPopup();
+                            instructionText.textContent = "Now, click on the map to set your destination.";
+                        }, onLocationError);
+                    } else {
+                        instructionText.textContent = "Geolocation is not supported by your browser.";
+                    }
+                } else if (!endMarker) {
+                    endMarker = L.marker(e.latlng, { icon: L.icon({ iconUrl: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="%23FF5722"><path d="M16 0C9.69 0 4.5 5.19 4.5 11.5c0 6.63 11.5 20.5 11.5 20.5s11.5-13.87 11.5-20.5C27.5 5.19 22.31 0 16 0zm0 15c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/></svg>', iconSize: [32, 32], iconAnchor: [16, 32], popupAnchor: [0, -30] }) }).addTo(map)
+                        .bindPopup("End Point").openPopup();
+                    instructionText.textContent = "Generating route...";
+                    
+                    // Remove start/end markers and add the rally route
+                    map.removeLayer(startMarker);
+                    map.removeLayer(endMarker);
+                    getRoute(startMarker.getLatLng(), endMarker.getLatLng());
+                }
+            });
+            
+            // Function to handle successful location updates
+            function onLocationUpdate(position) {
+                const lat = position.coords.latitude;
+                const lon = position.coords.longitude;
+                const currentLatLng = [lat, lon];
+                
+                if (!currentPositionMarker) {
+                    currentPositionMarker = L.circleMarker(currentLatLng, {
+                        color: 'red',
+                        fillColor: '#f03',
+                        fillOpacity: 0.8,
+                        radius: 8,
+                        className: 'blinking-dot'
+                    }).addTo(map);
+                    map.setView(currentLatLng, 15);
+                } else {
+                    currentPositionMarker.setLatLng(currentLatLng);
+                    map.panTo(currentLatLng);
+                }
+
+                // Check for proximity to next turn
+                if (currentTurnIndex < currentRoute.length) {
+                    const nextPosition = currentRoute[currentTurnIndex];
+                    const distance = map.distance(currentLatLng, nextPosition);
+
+                    if (distance < 50) { // 50 meters tolerance
+                         updateDisplay();
+                         currentTurnIndex++;
+                    }
+                }
+            }
+
+            // Function to handle location errors
+            function onLocationError(error) {
+                instructionText.textContent = `Location error: ${error.message}`;
+                console.error('Geolocation error:', error);
+            }
+
+            // "Reset" button click handler
+            resetBtn.addEventListener('click', () => {
+                if(watchId) {
+                    navigator.geolocation.clearWatch(watchId);
+                }
+                currentTurnIndex = 0;
+                if (routePolyline) map.removeLayer(routePolyline);
+                if (currentPositionMarker) map.removeLayer(currentPositionMarker);
+                startMarker = null;
+                endMarker = null;
+                currentRoute = [];
+                currentPacenotes = [];
+                resetBtn.classList.add('hidden');
+                muteBtn.classList.add('hidden');
+                navigationDisplay.classList.add('hidden');
+                instructionText.classList.remove('hidden');
+                instructionText.textContent = "Click on the map to set your starting point.";
+            });
+
+            // Text-to-speech function
+            function speakInstruction(text) {
+                if (isMuted) return;
+                const utterance = new SpeechSynthesisUtterance(text);
+                window.speechSynthesis.speak(utterance);
+            }
+
+            // Mute button handler
+            muteBtn.addEventListener('click', () => {
+                isMuted = !isMuted;
+                muteBtn.textContent = isMuted ? 'Unmute' : 'Mute';
+            });
+
+            // Function to update the display
+            const updateDisplay = () => {
+                if (currentTurnIndex < currentPacenotes.length) {
+                    const turn = currentPacenotes[currentTurnIndex];
+                    const position = currentRoute[currentTurnIndex];
+                    directionElement.textContent = turn.direction;
+                    sharpnessElement.textContent = turn.sharpness ? `Sharpness ${turn.sharpness}` : '';
+                    locationElement.textContent = `Lat: ${position[0].toFixed(4)}, Lon: ${position[1].toFixed(4)}`;
+
+                    let speakText = `${turn.direction}`;
+                    if(turn.sharpness) {
+                        speakText += ` and sharpness ${turn.sharpness}`;
+                    }
+                    speakInstruction(speakText);
+                } else {
+                    directionElement.textContent = "Route finished!";
+                    sharpnessElement.textContent = "Great run!";
+                    locationElement.textContent = "";
+                    speakInstruction("Congratulations, you have finished the rally!");
+                }
+            };
+
+            if ('serviceWorker' in navigator) {
+                navigator.serviceWorker.register('service-worker.js')
+                    .then(registration => console.log('Service Worker registered with scope:', registration.scope))
+                    .catch(error => console.log('Service Worker registration failed:', error));
+            }
+        });
+    </script>
+</body>
+</html>
